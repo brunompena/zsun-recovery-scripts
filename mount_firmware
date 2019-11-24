@@ -1,0 +1,118 @@
+#!/bin/sh
+
+mtdpart="firmware"
+
+workdir="/var/run/mount_firmware"
+statefile="${workdir}/state"
+dumpfile="${workdir}/${mtdpart}.bin"
+
+workromdir="${workdir}/rom"
+workoverlaydir="${workdir}/overlay"
+
+overlayfsdir="/${mtdpart}"
+romdir="${overlayfsdir}/rom"
+overlaydir="${overlayfsdir}/overlay"
+
+squashfs_marker="^6873"
+jffs2_marker="^(1985|deadc0de)"
+
+function fs_search() {
+	local device=$1
+	local offset=$2
+	local size=$3
+	local blocksize=$4
+	local pattern=$5
+
+	while [[ ${offset} -lt ${size} ]]; do
+		local data=$(hexdump -e '"%x"' -n 4 -s ${offset} ${device} 2>/dev/null | egrep "${pattern}")
+		[[ ! -z "${data}" ]] && echo "${offset}" && break
+		offset=$((offset+blocksize))
+	done
+}
+
+function main() {
+	if [[ -e "${statefile}" ]]; then
+		echo "Firmware already mounted at ${overlayfsdir}"
+		exit 1
+	fi
+
+	mkdir -p ${workdir}
+
+	echo "Searching for ${mtdpart}..."
+	local mtd=$(awk '$4 == "\"'${mtdpart}'\"" { print }' /proc/mtd | cut -d: -f1)
+	local size=$(cat /sys/class/mtd/${mtd}/size 2>/dev/null)
+	local blocksize=$(cat /sys/class/mtd/${mtd}/erasesize 2>/dev/null)
+	if [[ -z "${mtd}" || -z "${size}" || -z "${blocksize}" ]]; then
+		echo "Could not find ${mtdpart} partition"
+		exit 1
+	fi
+
+	echo "Dumping contents of ${mtdpart} partition..."
+	dd if=/dev/${mtd}ro of=${dumpfile} bs=${blocksize} 2>/dev/null
+	if [[ "$?" == "1" ]]; then
+		echo "Could not dump contents of ${mtdpart} partition"
+		exit 1
+	fi
+
+	echo "Searching for squashfs filesystem..."
+	local squashfs=$(fs_search ${dumpfile} 0 ${size} ${blocksize} ${squashfs_marker})
+	if [[ -z "${squashfs}" ]]; then
+		echo "Could not find squashfs filesystem"
+		exit 1
+	fi
+
+	echo "Searching for jffs2 filesystem..."
+	local jffs2=$(fs_search ${dumpfile} ${squashfs} ${size} ${blocksize} ${jffs2_marker})
+	if [[ -z "${jffs2}" ]]; then
+		echo "Could not find jffs2 filesystem"
+		exit 1
+	fi
+
+	echo "Creating rootfs loop device..."
+	local rootfs=$(losetup --offset ${squashfs} --sizelimit $((jffs2-squashfs)) -f --show ${dumpfile} 2>/dev/null)
+	if [[ -z "${rootfs}" ]]; then
+		echo "Could not create rootfs loop device"
+		exit 1
+	fi
+
+	echo "Creating rootfs_data loop device..."
+	local rootfs_data=$(losetup --offset ${jffs2} --sizelimit $((size-jffs2)) -f --show ${dumpfile} 2>/dev/null)
+	if [[ -z "${rootfs_data}" ]]; then
+		echo "Could not create rootfs_data loop device"
+		losetup -d ${rootfs} 2>/dev/null
+		exit 1
+	fi
+
+	modprobe -q block2mtd
+
+	echo "Creating auxiliary mtdblock device partitions..."
+	echo "${rootfs},${blocksize}" > /sys/module/block2mtd/parameters/block2mtd
+	echo "${rootfs_data},${blocksize}" > /sys/module/block2mtd/parameters/block2mtd
+	local rom=$(awk '$4 == "\"'${rootfs}'\"" { print }' /proc/mtd | cut -d: -f1 | sed 's/^mtd/mtdblock/')
+	local overlay=$(awk '$4 == "\"'${rootfs_data}'\"" { print }' /proc/mtd | cut -d: -f1 | sed 's/^mtd/mtdblock/')
+
+	echo "Mounting rootfs..."
+	mkdir -p ${workromdir}
+	mount -t squashfs /dev/${rom} ${workromdir}
+
+	echo "Mounting rootfs_data..."
+	mkdir -p ${workoverlaydir}
+	mount -t jffs2 -o noatime /dev/${overlay} ${workoverlaydir}
+	mkdir -p ${workoverlaydir}/upper
+	mkdir -p ${workoverlaydir}/work
+	ln -sf 2 ${workoverlaydir}/.fs_state
+
+	echo "Creating overlay filesystem..."
+	mkdir -p ${overlayfsdir}
+	mount -t overlay -o noatime,lowerdir=${workromdir},upperdir=${workoverlaydir}/upper,workdir=${workoverlaydir}/work overlayfs:${overlayfsdir} ${overlayfsdir}
+	mount -o bind ${workromdir} ${romdir}
+	mount -o bind ${workoverlaydir} ${overlaydir}
+
+	echo "Saving mount state..."
+	echo "rootfs=${rootfs}" > ${statefile}
+	echo "rootfs_data=${rootfs_data}" >> ${statefile}
+
+	echo "${mtdpart} was successfully mounted at ${overlayfsdir}"
+}
+
+main
