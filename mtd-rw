@@ -1,0 +1,25 @@
+#!/bin/sh
+
+case "$1" in
+    lock) # lock all mtd partitions
+       "$0" unlocked && rmmod mtd-rw
+       ;;
+
+    unlock) # unlock all mtd partitions
+        "$0" locked && insmod "$(find /lib/modules/ -name mtd-rw.ko)" i_want_a_brick=1
+        ;;
+
+    locked) # check if mtd partitions are locked
+        ! "$0" unlocked
+        ;;
+
+    unlocked) # check if mtd partitions are unlocked
+        lsmod | egrep -qs "^mtd_rw "
+        ;;
+
+    *) # usage help message
+        echo "Usage: $(basename $0) <lock|unlock|locked|unlocked>"
+        ;;
+esac
+
+exit $?

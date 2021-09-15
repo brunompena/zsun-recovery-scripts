@@ -1,0 +1,79 @@
+#!/bin/sh
+
+# check if firmware is already mounted
+if egrep -qs "^overlayfs:/firmware " /proc/mounts; then
+    echo "firmware is already mounted">&2
+    exit 1
+fi
+
+# find firmware mtd partition
+firmware=$(grep '"firmware"' /proc/mtd | cut -d: -f1)
+firmware_size=$(cat /sys/class/mtd/${firmware}/size)
+firmware_blocksize=$(cat /sys/class/mtd/${firmware}/erasesize)
+
+# setup filesystem markers (rootfs: squashfs, rootfs_data: jffs2)
+rootfs_marker="6873"
+rootfsdata_marker="(deadc0de|1985)"
+
+# search for the rootfs filesystem offset within the firmware mtd partition
+rootfs_offset=0
+while [ ${rootfs_offset} -lt ${firmware_size} ]; do
+    # dump four bytes at offset (as hexadecimal string) and check if matches the marker pattern
+    if hexdump -e '"%x"' -n 4 -s ${rootfs_offset} /dev/${firmware} | egrep -qs "^${rootfs_marker}"; then
+        # marker found, break loop
+        break
+    fi
+    # continue searching, move to the next mtd block
+    rootfs_offset=$((rootfs_offset + firmware_blocksize))
+done
+
+# search for the rootfs_data filesystem offset within the firmware mtd partition
+rootfsdata_offset=$((rootfs_offset + firmware_blocksize))
+while [ ${rootfsdata_offset} -lt ${firmware_size} ]; do
+    # dump four bytes at offset (as hexadecimal string) and check if matches the marker pattern
+    if hexdump -e '"%x"' -n 4 -s ${rootfsdata_offset} /dev/${firmware} | egrep -qs "^${rootfsdata_marker}"; then
+        # marker found, break loop
+        break
+    fi
+    # continue searching, move to the next mtd block
+    rootfsdata_offset=$((rootfsdata_offset + firmware_blocksize))
+done
+
+# calculate filesystem sizes
+rootfs_size=$((rootfsdata_offset - rootfs_offset))
+rootfsdata_size=$((firmware_size - rootfsdata_offset))
+
+# create loop device for each filesystem (virtual "partition" delimited by offset and size)
+rootfs_loop=$(losetup --offset ${rootfs_offset} --sizelimit ${rootfs_size} -f --show /dev/mtdblock${firmware:3})
+rootfsdata_loop=$(losetup --offset ${rootfsdata_offset} --sizelimit ${rootfsdata_size} -f --show /dev/mtdblock${firmware:3})
+
+# create virtual mtd for the loop devices
+modprobe -q block2mtd
+echo "${rootfs_loop},${firmware_blocksize}" > /sys/module/block2mtd/parameters/block2mtd
+echo "${rootfsdata_loop},${firmware_blocksize}" > /sys/module/block2mtd/parameters/block2mtd
+
+# search for the newly created mtd names
+rootfs=$(grep '"'${rootfs_loop}'"' /proc/mtd | cut -d: -f1)
+rootfsdata=$(grep '"'${rootfsdata_loop}'"' /proc/mtd | cut -d: -f1)
+
+# create mountpoint if needed
+[ ! -d /firmware ] && mkdir /firmware
+
+# mount filesystems (rootfs and rootfs_data)
+mount -t squashfs /dev/mtdblock${rootfs:3} /firmware
+mount -t jffs2 -o noatime /dev/mtdblock${rootfsdata:3} /firmware/overlay
+
+# initialize rootfs_data
+[ ! -d /firmware/overlay/upper ] && mkdir /firmware/overlay/upper
+[ ! -d /firmware/overlay/work ] && mkdir /firmware/overlay/work
+[ ! -h /firmware/overlay/.fs_state ] && ln -s 2 /firmware/overlay/.fs_state
+
+# create rootfs_data overlay at /mnt
+mount -t overlay -o noatime,lowerdir=/firmware,upperdir=/firmware/overlay/upper,workdir=/firmware/overlay/work overlayfs:/firmware /mnt
+
+# combine all mountpoints on /mnt
+mount --move /firmware/overlay /mnt/overlay
+mount --move /firmware /mnt/rom
+
+# finally, move the result to /firmware
+mount --move /mnt /firmware

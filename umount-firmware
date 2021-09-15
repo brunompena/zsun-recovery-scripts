@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# check if firmware is mounted
+if ! egrep -qs "^overlayfs:/firmware " /proc/mounts; then
+    echo "firmware is not mounted">&2
+    exit 1
+fi
+
+# search /proc/mounts for firmware's virtual mtd devices
+rootfs=$(grep " /firmware/rom " /proc/mounts | cut -d" " -f1 | cut -d/ -f3 | sed 's/block//')
+rootfsdata=$(grep " /firmware/overlay " /proc/mounts | cut -d" " -f1 | cut -d/ -f3 | sed 's/block//')
+
+# map the virtual mtd devices to the corresponding loop devices
+rootfs_loop=$(egrep "^${rootfs}:" /proc/mtd | cut -d\" -f2)
+rootfsdata_loop=$(egrep "^${rootfsdata}:" /proc/mtd | cut -d\" -f2)
+
+# umount all mountpoints
+umount /firmware/overlay
+umount /firmware/rom
+umount /firmware
+
+# remove virtual mtd devices (only possible by unloading the block2mtd kernel module)
+rmmod block2mtd
+
+# remove the corresponding loop devices
+losetup -d ${rootfs_loop}
+losetup -d ${rootfsdata_loop}

@@ -1,0 +1,42 @@
+#!/bin/sh
+
+# display warn message, wait for user confirmation before continuing
+echo -n "erase all settings and remove any installed packages? [N/y] ">&2 && read
+[ "${REPLY}" != "y" ] && exit 1
+
+# check firmware mount state to then delete data accordingly
+if egrep -qs "^overlayfs:/firmware " /proc/mounts; then
+    # inform user about firmware mount state and action taken to reset rootfs_data
+    echo "firmware is mounted, only erasing files">&2
+
+    # erase all files (including "dot" and "dot-dot" files)
+    rm -rf /firmware/overlay/upper/*
+    rm -rf /firmware/overlay/upper/.[^.]*
+    rm -rf /firmware/overlay/upper/..?*
+else
+    # inform user about firmware mount state and action taken to reset rootfs_data
+    echo "firmware not mounted, marking it to be erased on next mount">&2
+
+    # find firmware mtd partition
+    firmware=$(grep '"firmware"' /proc/mtd | cut -d: -f1)
+    firmware_size=$(cat /sys/class/mtd/${firmware}/size)
+    firmware_blocksize=$(cat /sys/class/mtd/${firmware}/erasesize)
+
+    # initialize rootfs_data search variables
+    rootfsdata_marker="(deadc0de|1985)"
+    rootfsdata_offset=0
+
+    # search for rootfs_data inside firmware mtd partition
+    while [ ${rootfsdata_offset} -lt ${firmware_size} ]; do
+        # dump four bytes at offset (as hexadecimal string) and check if matches the marker pattern
+        if hexdump -e '"%x"' -n 4 -s ${rootfsdata_offset} /dev/${firmware} | egrep -qs "^${rootfsdata_marker}"; then
+            # marker found, break loop
+            break
+        fi
+        # continue searching, move to the next mtd block
+        rootfsdata_offset=$((rootfsdata_offset + firmware_blocksize))
+    done
+
+    # write jffs2 marker (0xdeadc0de) to force initialization of rootfs_data on the next mount
+    echo -ne "\xde\xad\xc0\xde" | dd of=/dev/mtdblock${firmware:3} bs=${firmware_blocksize} seek=$((rootfsdata_offset / firmware_blocksize)) count=1 conv=sync &>/dev/null
+fi

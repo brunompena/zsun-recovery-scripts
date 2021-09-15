@@ -1,0 +1,37 @@
+#!/bin/sh
+
+# check if script arguments are valid
+if [ "$1" != "save" -a "$1" != "reset" ]; then
+    # display usage message in case of insufficient or invalid arguments
+    echo "Usage: $(basename $0) <save|reset>"
+    exit 1
+fi
+
+# check mtd state and unlock if needed
+if mtd-rw locked; then
+    mtd-rw unlock
+    relock=1
+fi
+
+# check whether to save or reset the current configuration
+if [ "$1" == "save" ]; then
+    # create archive of the current configuration
+    tar czf /tmp/config.tar.gz -C /volatile/upper $(ls /volatile/upper/)
+else
+    # create an empty configuration archive
+    dd if=/dev/zero bs=10240 count=1 2>/dev/null | gzip > /tmp/config.tar.gz
+fi
+
+# store the configuration archive to mtd
+snapshot_tool config_write &>/dev/null
+if [ "$?" != "0" ]; then
+    echo "operation failed"
+fi
+
+# clean up configuration archive
+rm -f /tmp/config.tar.gz
+
+# lock mtd if it was unlocked by this script
+if [ "${relock}" == "1" ]; then
+    mtd-rw lock
+fi
